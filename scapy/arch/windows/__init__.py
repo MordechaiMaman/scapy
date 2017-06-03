@@ -69,36 +69,47 @@ class WinProgPath(ConfClass):
 
 conf.prog = WinProgPath()
 
+
+def _get_dict_from_wmi_raw_object(lines):
+    ret_dict = {}
+    for i in lines:
+        key, value = i.split(':', 1)
+        ret_dict[key.strip()] = value.strip()
+    return ret_dict
+
+
+def _get_wmi_objects(class_name, fields, condition=None):
+    """Get a WMI object using powershell"""
+    where_condition = '| where ' + condition if condition is not None else ''
+    ps_command = ['powershell', '-NoProfile', 'Get-WMIObject -class {class_name} {where_condition} | select {select_fields} | fl'.format(
+        class_name=class_name,
+        where_condition=where_condition, 
+        select_fields=', '.join(fields))]
+    
+    output = sp.check_output(ps_command).decode(errors='replace').strip()
+    for raw_object in output.split('\r\n\r\n'):
+        yield _get_dict_from_wmi_raw_object(raw_object.split('\r\n'))
+
+
 class PcapNameNotFoundError(Scapy_Exception):
     pass    
 
+
 def get_windows_if_list():
-    ps = sp.Popen(['powershell', '-NoProfile', 'Get-WMIObject -class Win32_NetworkAdapter', '|', 'select Name, @{Name="InterfaceIndex";Expression={$_.InterfaceIndex}}, @{Name="InterfaceDescription";Expression={$_.Description}},@{Name="InterfaceGuid";Expression={$_.GUID}}, @{Name="MacAddress";Expression={$_.MacAddress.Replace(":","-")}} | where InterfaceGuid -ne $null', '|', 'fl'], stdout = sp.PIPE)
-    stdout, stdin = ps.communicate(timeout = 10)
-    current_interface = None
     interface_list = []
-    for i in stdout.decode(errors='replace').split('\n'):
-        if not i.strip():
-            continue
-        if i.find(':')<0:
-            continue
-        name, value = [ j.strip() for j in i.split(':') ]
-        if name == 'Name':
-            if current_interface:
-                interface_list.append(current_interface)
-            current_interface = {}
-            current_interface['name'] = value
-        elif name == 'InterfaceIndex':
-            current_interface['win_index'] = int(value)
-        elif name == 'InterfaceDescription':
-            current_interface['description'] = value
-        elif name == 'InterfaceGuid':
-            current_interface['guid'] = value
-        elif name == 'MacAddress':
-            current_interface['mac'] = ':'.join([ j for j in value.split('-')])    
-    if current_interface:
-        interface_list.append(current_interface)
+    for wmi_object in _get_wmi_objects('Win32_NetworkAdapter', 
+                                       ['Name', 'InterfaceIndex', 'Description', 'GUID', 'MacAddress'], 
+                                       'GUID -ne $null'):
+        interface_list.append({
+            'name': wmi_object['Name'],
+            'win_index': int(wmi_object['InterfaceIndex']),
+            'description': wmi_object['Description'],
+            'guid': wmi_object['GUID'],
+            'mac': wmi_object['MacAddress']
+            })
+
     return interface_list
+
 
 class NetworkInterface(object):
     """A network interface of your local host"""
@@ -236,23 +247,19 @@ def count_bits_in_ip(ip):
 
 def read_routes():
     routes = []
-    ps = sp.Popen(['powershell', '-NoProfile', 'Get-WmiObject', '-Class', 'win32_IP4RouteTable', '|', 'select', 'InterfaceIndex,', 'Destination,', 'Mask,', 'NextHop'], stdout = sp.PIPE)
-    stdout, stdin = ps.communicate(timeout = 10)
-    for l in stdout.decode(errors='replace').split('\n'):
-        line = l.split()
-        if len(line) is not 0 and line[0].isdigit():
-            iface_index, destination_ip, subnet_mask, next_hop = line
-            try:
-                iface = devname_from_index(int(iface_index))
-                addr = ifaces[iface].ip
-            except:
-                continue
-            routes.append((atol(destination_ip),
-                           itom(count_bits_in_ip(subnet_mask)),
-                           next_hop,
-                           iface,
-                           addr))
+    for wmi_object in _get_wmi_objects('win32_IP4RouteTable', ['InterfaceIndex', 'Destination', 'Mask', 'NextHop']):
+        try:
+            iface = devname_from_index(int(wmi_object['InterfaceIndex']))
+            addr = ifaces[iface].ip
+        except:
+            continue
+        routes.append((atol(wmi_object['Destination']),
+                       itom(count_bits_in_ip(wmi_object['Mask'])),
+                       wmi_object['NextHop'],
+                       iface,
+                       addr))
     return routes
+
 
 def read_routes6():
     return []
@@ -481,21 +488,18 @@ L2socket: use the provided L2socket
 import scapy.sendrecv
 scapy.sendrecv.sniff = sniff
 
-# def get_if_list():
-#     print('windows if_list')
-#     return sorted(ifaces.keys())
+
+def _is_virtual_interface(name):
+    name = name.lower()
+    return 'virtual' in name or 'vmware' in name or 'virtualbox' in name
+
 
 def get_working_if():
-    try:
-        if 'Ethernet' in ifaces and ifaces['Ethernet'].ip != '0.0.0.0':
-            return 'Ethernet'
-        elif 'Wi-Fi' in ifaces and ifaces['Wi-Fi'].ip != '0.0.0.0':
-            return 'Wi-Fi'
-        elif len(ifaces) > 0:
-            return ifaces[list(ifaces.keys())[0]].name
-        else:
-            return LOOPBACK_NAME
-    except:
+    working_interfaces = _get_wmi_objects('win32_NetworkAdapter', ['Name'], 'NetConnectionStatus -e 2')
+    working_interfaces = [i['Name'] for i in working_interfaces if not _is_virtual_interface(i['Name'])]
+    if len(working_interfaces) is 0:
         return LOOPBACK_NAME
+    return working_interfaces[0]
+
 
 conf.iface = get_working_if()
