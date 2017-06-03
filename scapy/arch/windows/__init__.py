@@ -73,12 +73,11 @@ class PcapNameNotFoundError(Scapy_Exception):
     pass    
 
 def get_windows_if_list():
-    # Windows 8+ way: ps = sp.Popen(['powershell', 'Get-NetAdapter', '|', 'select Name, InterfaceIndex, InterfaceDescription, InterfaceGuid, MacAddress', '|', 'fl'], stdout = sp.PIPE, universal_newlines = True)
-    ps = sp.Popen(['powershell', '-NoProfile', 'Get-WMIObject -class Win32_NetworkAdapter', '|', 'select Name, @{Name="InterfaceIndex";Expression={$_.InterfaceIndex}}, @{Name="InterfaceDescription";Expression={$_.Description}},@{Name="InterfaceGuid";Expression={$_.GUID}}, @{Name="MacAddress";Expression={$_.MacAddress.Replace(":","-")}} | where InterfaceGuid -ne $null', '|', 'fl'], stdout = sp.PIPE, universal_newlines = True)
+    ps = sp.Popen(['powershell', '-NoProfile', 'Get-WMIObject -class Win32_NetworkAdapter', '|', 'select Name, @{Name="InterfaceIndex";Expression={$_.InterfaceIndex}}, @{Name="InterfaceDescription";Expression={$_.Description}},@{Name="InterfaceGuid";Expression={$_.GUID}}, @{Name="MacAddress";Expression={$_.MacAddress.Replace(":","-")}} | where InterfaceGuid -ne $null', '|', 'fl'], stdout = sp.PIPE)
     stdout, stdin = ps.communicate(timeout = 10)
     current_interface = None
     interface_list = []
-    for i in stdout.split('\n'):
+    for i in stdout.decode(errors='replace').split('\n'):
         if not i.strip():
             continue
         if i.find(':')<0:
@@ -230,35 +229,29 @@ _orig_get_if_raw_hwaddr = pcapdnet.get_if_raw_hwaddr
 pcapdnet.get_if_raw_hwaddr = lambda iface,*args,**kargs: [ int(i, 16) for i in ifaces[iface].mac.split(':') ]
 get_if_raw_hwaddr = pcapdnet.get_if_raw_hwaddr
 
+
+def count_bits_in_ip(ip):
+    return sum([bin(int(i)).count("1") for i in ip.split(".")])
+
+
 def read_routes():
     routes = []
-    if_index = '(\d+)'
-    dest = '(\d+\.\d+\.\d+\.\d+)/(\d+)'
-    next_hop = '(\d+\.\d+\.\d+\.\d+)'
-    metric_pattern = "(\d+)"
-    delim = "\s+"        # The columns are separated by whitespace
-    netstat_line = delim.join([if_index, dest, next_hop, metric_pattern])
-    pattern = re.compile(netstat_line)
-    # This works only starting from Windows 8/2012 and up. For older Windows another solution is needed
-    ps = sp.Popen(['powershell', 'Get-NetRoute', '-AddressFamily IPV4', '|', 'select ifIndex, DestinationPrefix, NextHop, RouteMetric'], stdout = sp.PIPE, universal_newlines = True)
+    ps = sp.Popen(['powershell', '-NoProfile', 'Get-WmiObject', '-Class', 'win32_IP4RouteTable', '|', 'select', 'InterfaceIndex,', 'Destination,', 'Mask,', 'NextHop'], stdout = sp.PIPE)
     stdout, stdin = ps.communicate(timeout = 10)
-    for l in stdout.split('\n'):
-        match = re.search(pattern,l)
-        if match:
+    for l in stdout.decode(errors='replace').split('\n'):
+        line = l.split()
+        if len(line) is not 0 and line[0].isdigit():
+            iface_index, destination_ip, subnet_mask, next_hop = line
             try:
-                iface = devname_from_index(int(match.group(1)))
+                iface = devname_from_index(int(iface_index))
                 addr = ifaces[iface].ip
             except:
                 continue
-            dest = atol(match.group(2))
-            mask = itom(int(match.group(3)))
-            gw = match.group(4)
-            # try:
-            #     intf = pcapdnet.dnet.intf().get_dst(pcapdnet.dnet.addr(type=2, addrtxt=dest))
-            # except OSError:
-            #     log_loading.warning("Building Scapy's routing table: Couldn't get outgoing interface for destination %s" % dest)
-            #     continue               
-            routes.append((dest, mask, gw, iface, addr))
+            routes.append((atol(destination_ip),
+                           itom(count_bits_in_ip(subnet_mask)),
+                           next_hop,
+                           iface,
+                           addr))
     return routes
 
 def read_routes6():
